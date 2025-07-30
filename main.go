@@ -1,107 +1,193 @@
 package main
 
 import (
-	"bufio"
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
+	"net/url"
 	"os"
-	"strings"
-	"sync"
+	"regexp"
+
+	"github.com/jszwec/csvutil"
+	"github.com/rs/zerolog/log"
+	"golang.org/x/net/proxy"
+
+	"github.com/juju/errors"
+	"scraping/pkg/util"
 )
 
-type VPNEntry struct {
-	HostName     string `json:"host_name"`
-	IP           string `json:"ip"`
-	Country      string `json:"country"`
-	Score        string `json:"score"`
-	Ping         string `json:"ping"`
-	Speed        string `json:"speed"`
-	Port         string `json:"port"`
-	ConfigBase64 string `json:"-"`
+const (
+	vpnList = "https://www.vpngate.net/api/iphone/"
+)
+
+// Server holds in formation about a vpn relay server
+type Server struct {
+	HostName          string `csv:"#HostName"`
+	CountryLong       string `csv:"CountryLong"`
+	CountryShort      string `csv:"CountryShort"`
+	Score             int    `csv:"Score"`
+	IPAddr            string `csv:"IP"`
+	OpenVpnConfigData string `csv:"OpenVPN_ConfigData_Base64"`
+	Ping              string `csv:"Ping"`
+}
+type VPNJsonServer struct {
+	Country string `json:"country"`
+	IP      string `json:"ip"`
+	Port    string `json:"port"`
 }
 
-func extractPortFromConfig(configB64 string) string {
-	data, err := base64.StdEncoding.DecodeString(configB64)
+func streamToBytes(stream io.Reader) []byte {
+	buf := new(bytes.Buffer)
+	_, err := buf.ReadFrom(stream)
 	if err != nil {
-		return ""
+		log.Error().Msg("Unable to stream bytes")
 	}
-	lines := strings.Split(string(data), "\n")
-	for _, line := range lines {
-		if strings.HasPrefix(line, "remote ") {
-			parts := strings.Fields(line)
-			if len(parts) >= 3 {
-				return parts[2]
-			}
+	return buf.Bytes()
+}
+
+// parse csv
+func parseVpnList(r io.Reader) (*[]Server, error) {
+	var servers []Server
+
+	serverList := streamToBytes(r)
+
+	// Trim known invalid rows
+	serverList = bytes.TrimPrefix(serverList, []byte("*vpn_servers\r\n"))
+	serverList = bytes.TrimSuffix(serverList, []byte("*\r\n"))
+	serverList = bytes.ReplaceAll(serverList, []byte(`"`), []byte{})
+
+	if err := csvutil.Unmarshal(serverList, &servers); err != nil {
+		return nil, errors.Annotatef(err, "Unable to parse CSV")
+	}
+
+	return &servers, nil
+}
+
+// GetList returns a list of vpn servers
+func GetList(httpProxy string, socks5Proxy string) (*[]Server, error) {
+
+	var servers *[]Server
+	var client *http.Client
+
+	log.Info().Msg("Fetching the latest server list")
+
+	if httpProxy != "" {
+		proxyURL, err := url.Parse(httpProxy)
+		if err != nil {
+			log.Error().Msgf("Error parsing proxy: %s", err)
+			os.Exit(1)
 		}
-	}
-	return ""
-}
+		transport := &http.Transport{
+			Proxy: http.ProxyURL(proxyURL),
+		}
 
-func main() {
-	resp, err := http.Get("http://www.vpngate.net/api/iphone/")
+		client = &http.Client{
+			Transport: transport,
+		}
+
+	} else if socks5Proxy != "" {
+		dialer, err := proxy.SOCKS5("tcp", socks5Proxy, nil, proxy.Direct)
+		if err != nil {
+			log.Error().Msgf("Error creating SOCKS5 dialer: %v", err)
+			os.Exit(1)
+		}
+
+		httpTransport := &http.Transport{
+			Dial: dialer.Dial,
+		}
+
+		client = &http.Client{
+			Transport: httpTransport,
+		}
+	} else {
+		client = &http.Client{}
+	}
+
+	var r *http.Response
+
+	err := util.Retry(5, 1, func() error {
+		var err error
+		r, err = client.Get(vpnList)
+		if err != nil {
+			return err
+		}
+		defer r.Body.Close()
+
+		if r.StatusCode != 200 {
+			return errors.Annotatef(err, "Unexpected status code when retrieving vpn list: %d", r.StatusCode)
+		}
+
+		servers, err = parseVpnList(r.Body)
+
+		if err != nil {
+			return err
+		}
+
+		return nil
+	})
+
 	if err != nil {
-		panic(fmt.Sprintf("Failed to fetch data: %v", err))
+		return nil, err
 	}
-	defer resp.Body.Close()
 
-	scanner := bufio.NewScanner(resp.Body)
+	return servers, nil
+}
+func main() {
+	servers, err := GetList("", "")
+	if err != nil {
+		log.Fatal().Err(err).Msg("")
+	}
+	if err = saveAsJSON(servers, "servers.json"); err != nil {
+		log.Fatal().Err(err).Msg("Failed to save JSON")
+	}
+}
+func extractPortFromConfig(configData string) (string, error) {
 
-	var wg sync.WaitGroup
-	var mu sync.Mutex
-	var entries []VPNEntry
+	decoded, err := base64.StdEncoding.DecodeString(configData)
+	if err != nil {
+		return "", errors.Annotatef(err, "Failed to decode base64 config")
+	}
 
-	for scanner.Scan() {
-		line := scanner.Text()
+	config := string(decoded)
 
-		if strings.HasPrefix(line, "*") || strings.HasPrefix(line, "#") || strings.Contains(line, "HostName") {
+	// Look for remote lines in the config
+	re := regexp.MustCompile(`remote\s+[\w.-]+\s+(\d+)`)
+	matches := re.FindStringSubmatch(config)
+	if len(matches) < 2 {
+		return "", errors.New("No port found in OpenVPN config")
+	}
+
+	return matches[1], nil
+}
+func saveAsJSON(servers *[]Server, filename string) error {
+	var jsonServers []VPNJsonServer
+
+	for _, server := range *servers {
+		port, err := extractPortFromConfig(server.OpenVpnConfigData)
+		if err != nil {
+			log.Warn().Err(err).Msgf("Skipping server %s (no valid port)", server.IPAddr)
 			continue
 		}
 
-		fields := strings.Split(line, ",")
-		if len(fields) >= 15 {
-			configBase64 := fields[14]
-			wg.Add(1)
-			go func(f []string, config string) {
-				defer wg.Done()
-
-				entry := VPNEntry{
-					HostName: f[0],
-					IP:       f[1],
-					Country:  f[5],
-					Score:    f[2],
-					Ping:     f[3],
-					Speed:    f[4],
-					Port:     extractPortFromConfig(config),
-				}
-
-				if entry.Port != "" {
-					mu.Lock()
-					entries = append(entries, entry)
-					mu.Unlock()
-				}
-			}(fields, configBase64)
-		}
+		jsonServers = append(jsonServers, VPNJsonServer{
+			Country: server.CountryLong,
+			IP:      server.IPAddr,
+			Port:    port,
+		})
 	}
 
-	wg.Wait()
-
-	if err = scanner.Err(); err != nil {
-		panic(fmt.Sprintf("Failed to read response body: %v", err))
-	}
-
-	file, err := os.Create("list.json")
+	file, err := json.MarshalIndent(jsonServers, "", "  ")
 	if err != nil {
-		panic(err)
-	}
-	defer file.Close()
-
-	encoder := json.NewEncoder(file)
-	encoder.SetIndent("", "  ")
-	if err := encoder.Encode(entries); err != nil {
-		panic(err)
+		return fmt.Errorf("failed to marshal JSON: %v", err)
 	}
 
-	fmt.Printf("✅ Saved %d VPN entries (with ports) to list.json\n", len(entries))
+	if err := os.WriteFile(filename, file, 0644); err != nil {
+		return fmt.Errorf("failed to write JSON file: %v", err)
+	}
+
+	log.Info().Msgf("Successfully saved %d servers to %s", len(jsonServers), filename)
+	return nil
 }
